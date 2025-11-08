@@ -1,4 +1,4 @@
-# app.py
+# app.py - Final corrected version (keeps your UI + fixes forecasting)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -6,14 +6,14 @@ import plotly.graph_objects as go
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from statsmodels.tsa.arima.model import ARIMA
 from statsmodels.tsa.stattools import adfuller
-from sklearn.metrics import mean_squared_error, mean_absolute_percentage_error
+from sklearn.metrics import mean_squared_error
 import warnings
 warnings.filterwarnings('ignore')
 
 # -------------------- PAGE CONFIG --------------------
 st.set_page_config(page_title="Power Forecasting", page_icon="📈", layout="wide")
 
-# Initialize session state keys (if not already)
+# Initialize session state keys
 for key, val in {
     'df': None,
     'freq': None,
@@ -160,7 +160,7 @@ with tab2:
             is_stationary = False
             st.info("ADF test could not be computed on this series.")
 
-        # Transform if needed
+        # Transform if needed (we keep transforms optional and simple)
         transform = 'none'
         values = df['Value'].values.copy()
         if not is_stationary and np.all(values > 0):
@@ -184,14 +184,21 @@ with tab2:
                 return np.nan, np.nan, np.nan
             rmse = np.sqrt(mean_squared_error(true, pred))
             nrmse = rmse / np.mean(true) if np.mean(true) != 0 else np.nan
-            mape = mean_absolute_percentage_error(true, pred) * 100 if np.all(true != 0) else np.nan
+            # MAPE safe: avoid dividing by zero
+            mape = np.nan
+            try:
+                nonzero = true != 0
+                if nonzero.any():
+                    mape = (np.mean(np.abs((true[nonzero] - pred[nonzero]) / true[nonzero])) * 100)
+            except Exception:
+                mape = np.nan
             return rmse, nrmse, mape
 
         # prepare train/test split
         n_rows = len(df)
         split = max(3, int(n_rows * 0.7))
         train_vals = values_log[:split]
-        test_vals = values[split:]  # keep test in original scale
+        test_vals = values[split:]  # keep test in original scale for metric comparison
         x_train = np.arange(len(train_vals))
         x_test = np.arange(len(train_vals), len(values_log))
 
@@ -234,12 +241,13 @@ with tab2:
             except Exception:
                 models_results['Exponential'] = {'rmse': np.nan, 'nrmse': np.nan, 'mape': np.nan, 'fitted': None}
 
-            # 4) Holt
+            # 4) Holt (Holt-Winters variant without seasonality)
             try:
                 if len(train_vals) >= 5:
                     train_series = pd.Series(train_vals, index=df.index[:split])
                     holt_model = ExponentialSmoothing(train_series, trend='add', seasonal=None, initialization_method='estimated').fit()
                     pred_test_holt_log = holt_model.forecast(steps=max(0, len(test_vals)))
+                    # If we trained on log, convert back
                     pred_test_holt = np.exp(pred_test_holt_log) if transform == 'log' else pred_test_holt_log
                     rmse_h, nrmse_h, mape_h = calc_metrics(test_vals, pred_test_holt) if len(test_vals) > 0 else (np.nan, np.nan, np.nan)
                     models_results['Holt'] = {'rmse': rmse_h, 'nrmse': nrmse_h, 'mape': mape_h, 'fitted': holt_model}
@@ -251,8 +259,8 @@ with tab2:
             # 5) ARIMA
             try:
                 if len(train_vals) >= 5:
-                    # ARIMA expects 1d array (we pass original or transformed series depending)
                     arima_train = pd.Series(train_vals, index=df.index[:split])
+                    # Fit ARIMA on transformed series if transform=='log', else on original train series
                     arima_model = ARIMA(arima_train, order=(1, 1, 1)).fit()
                     pred_test_arima_log = arima_model.forecast(steps=max(0, len(test_vals)))
                     pred_test_arima = np.exp(pred_test_arima_log) if transform == 'log' else pred_test_arima_log
@@ -265,85 +273,104 @@ with tab2:
 
             # 6) Simple Moving Average (SMA)
             try:
-                window = st.slider("SMA window (for Simple Moving Average)", 2, min(12, max(2, len(df)//2)), 3, key='sma_window')
+                max_window = max(2, min(12, len(df)//2))
+                window = st.slider("SMA window (for Simple Moving Average)", 2, max_window, 3, key='sma_window')
                 sma_series = pd.Series(df['Value']).rolling(window=window).mean()
-                sma_last = sma_series.iloc[-1]
+                sma_last = float(sma_series.iloc[-1]) if not np.isnan(sma_series.iloc[-1]) else float(df['Value'].iloc[-1])
                 sma_forecast_vals = np.array([sma_last] * len(test_vals)) if len(test_vals) > 0 else np.array([])
                 rmse_s, nrmse_s, mape_s = calc_metrics(test_vals, sma_forecast_vals) if len(test_vals) > 0 else (np.nan, np.nan, np.nan)
                 models_results['SMA'] = {'rmse': rmse_s, 'nrmse': nrmse_s, 'mape': mape_s, 'fitted': {'window': window, 'last': sma_last}}
             except Exception:
                 models_results['SMA'] = {'rmse': np.nan, 'nrmse': np.nan, 'mape': np.nan, 'fitted': None}
 
+            # store results
             st.session_state.models_results = models_results
 
-            # If Auto-Best selected, pick best and generate forecast
+            # determine selected forecast model
             if method == "Auto-Best (recommended)":
-                valid_rmse = {k: v['rmse'] for k, v in models_results.items() if np.isfinite(v['rmse'])}
+                valid_rmse = {k: v['rmse'] for k, v in models_results.items() if np.isfinite(v.get('rmse', np.nan))}
                 if valid_rmse:
                     best_model = min(valid_rmse, key=lambda k: valid_rmse[k])
                     st.success(f"🏆 Best model by RMSE: **{best_model}**  (RMSE = {valid_rmse[best_model]:.3f})")
                     selected_forecast_model = best_model
                 else:
-                    st.warning("No valid RMSE values to choose best model.")
-                    selected_forecast_model = None
+                    st.warning("No valid RMSE values to choose best model. Using fallback.")
+                    selected_forecast_model = "Linear"
             else:
                 selected_forecast_model = method
 
+            # Build future index robustly
+            last_date = df.index[-1]
+            if freq == 'A':
+                future_index = pd.date_range(start=last_date + pd.offsets.YearEnd(1), periods=n_future, freq='A')
+            elif freq == 'M':
+                future_index = pd.date_range(start=last_date + pd.offsets.MonthEnd(1), periods=n_future, freq='M')
+            else:
+                # fallback: yearly increments from last_date
+                future_index = [last_date + pd.DateOffset(years=i+1) for i in range(n_future)]
+                future_index = pd.to_datetime(future_index)
+
             # Forecast next n_future using selected_forecast_model
-            if selected_forecast_model:
-                # Build future index
-                last_date = df.index[-1]
-                if freq == 'A':
-                    future_index = pd.date_range(start=last_date + pd.offsets.YearEnd(1), periods=n_future, freq='A')
-                elif freq == 'M':
-                    future_index = pd.date_range(start=last_date + pd.offsets.MonthEnd(1), periods=n_future, freq='M')
+            future_pred = None
+            try:
+                if selected_forecast_model == 'Linear' and models_results['Linear']['fitted'] is not None:
+                    coef = models_results['Linear']['fitted']
+                    x_future = np.arange(len(df), len(df) + n_future)
+                    pred = np.polyval(coef, x_future)
+                    future_pred = np.exp(pred) if transform == 'log' else pred
+
+                elif selected_forecast_model == 'Quadratic' and models_results['Quadratic']['fitted'] is not None:
+                    coef = models_results['Quadratic']['fitted']
+                    x_future = np.arange(len(df), len(df) + n_future)
+                    pred = np.polyval(coef, x_future)
+                    future_pred = np.exp(pred) if transform == 'log' else pred
+
+                elif selected_forecast_model == 'Exponential' and models_results['Exponential']['fitted'] is not None:
+                    coef = models_results['Exponential']['fitted']
+                    x_future = np.arange(len(df), len(df) + n_future)
+                    pred_log = np.polyval(coef, x_future)
+                    future_pred = np.exp(pred_log)
+
+                elif selected_forecast_model == 'Holt' and models_results['Holt']['fitted'] is not None:
+                    holt_full = ExponentialSmoothing(values if transform == 'none' else values_log, trend='add', seasonal=None, initialization_method='estimated').fit()
+                    fut = holt_full.forecast(steps=n_future)
+                    future_pred = np.exp(fut) if transform == 'log' else np.asarray(fut)
+
+                elif selected_forecast_model == 'ARIMA' and models_results['ARIMA']['fitted'] is not None:
+                    arima_full = ARIMA(values if transform == 'none' else values_log, order=(1,1,1)).fit()
+                    fut = arima_full.forecast(steps=n_future)
+                    future_pred = np.exp(fut) if transform == 'log' else np.asarray(fut)
+
+                elif selected_forecast_model == 'SMA' and models_results['SMA']['fitted'] is not None:
+                    future_pred = np.array([models_results['SMA']['fitted']['last']] * n_future)
+
                 else:
-                    # fallback yearly
-                    future_index = pd.date_range(start=last_date + pd.DateOffset(years=1), periods=n_future, freq='Y')
-
-                x_future = np.arange(len(values), len(values) + n_future)
-
-                future_pred = np.full(n_future, np.nan)
-
-                try:
-                    if selected_forecast_model == 'Linear' and models_results['Linear']['fitted'] is not None:
-                        future_pred_log = np.polyval(models_results['Linear']['fitted'], x_future)
-                        future_pred = np.exp(future_pred_log) if transform == 'log' else future_pred_log
-                    elif selected_forecast_model == 'Quadratic' and models_results['Quadratic']['fitted'] is not None:
-                        future_pred_log = np.polyval(models_results['Quadratic']['fitted'], x_future)
-                        future_pred = np.exp(future_pred_log) if transform == 'log' else future_pred_log
-                    elif selected_forecast_model == 'Exponential' and models_results['Exponential']['fitted'] is not None:
-                        future_pred_log = np.polyval(models_results['Exponential']['fitted'], x_future)
-                        future_pred = np.exp(future_pred_log)
-                    elif selected_forecast_model == 'Holt' and models_results['Holt']['fitted'] is not None:
-                        holt_full = ExponentialSmoothing(values_log if transform == 'log' else values, trend='add', seasonal=None, initialization_method='estimated').fit()
-                        fut = holt_full.forecast(steps=n_future)
-                        future_pred = np.exp(fut) if transform == 'log' else fut
-                    elif selected_forecast_model == 'ARIMA' and models_results['ARIMA']['fitted'] is not None:
-                        arima_full = ARIMA(values_log if transform == 'log' else values, order=(1,1,1)).fit()
-                        fut = arima_full.forecast(steps=n_future)
-                        future_pred = np.exp(fut) if transform == 'log' else fut
-                    elif selected_forecast_model == 'SMA' and models_results['SMA']['fitted'] is not None:
-                        future_pred = np.array([models_results['SMA']['fitted']['last']] * n_future)
-                    else:
-                        # if not available, fallback to last observed
-                        future_pred = np.array([values[-1]] * n_future)
-                except Exception:
+                    # fallback to last observed values repeated
                     future_pred = np.array([values[-1]] * n_future)
 
-                forecast_df = pd.DataFrame({'Forecast': future_pred}, index=future_index)
-                st.session_state.forecast_df = forecast_df
+                # Ensure numeric and finite
+                future_pred = np.asarray(future_pred, dtype=float)
+                # Replace any inf/nan with last observed
+                future_pred[~np.isfinite(future_pred)] = float(values[-1])
 
-                # plot actual + forecast
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(x=df.index, y=df['Value'], name='Actual', mode='lines+markers'))
-                fig.add_trace(go.Scatter(x=forecast_df.index, y=forecast_df['Forecast'], name=f'{selected_forecast_model} Forecast', mode='lines+markers'))
-                fig.update_layout(title=f"Forecast ({selected_forecast_model})", xaxis_title="Date", yaxis_title="Value", template="plotly_white")
-                st.plotly_chart(fig, use_container_width=True)
+            except Exception as e:
+                st.warning(f"Forecast production failed for model '{selected_forecast_model}': {e}")
+                future_pred = np.array([float(values[-1])] * n_future)
 
-                st.subheader("Forecast Table")
-                out_df = forecast_df.reset_index().rename(columns={'index': 'Date', 'Forecast': 'Forecast Value'})
-                st.dataframe(out_df.style.format({'Forecast Value': '{:.2f}'}))
+            # Build forecast_df and store in session
+            forecast_df = pd.DataFrame({'Forecast': future_pred}, index=future_index)
+            st.session_state.forecast_df = forecast_df
+
+            # plot actual + forecast
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=df.index, y=df['Value'], name='Actual', mode='lines+markers'))
+            fig.add_trace(go.Scatter(x=forecast_df.index, y=forecast_df['Forecast'], name=f'{selected_forecast_model} Forecast', mode='lines+markers'))
+            fig.update_layout(title=f"Forecast ({selected_forecast_model})", xaxis_title="Date", yaxis_title="Value", template="plotly_white")
+            st.plotly_chart(fig, use_container_width=True)
+
+            st.subheader("Forecast Table")
+            out_df = forecast_df.reset_index().rename(columns={'index': 'Date', 'Forecast': 'Forecast Value'})
+            st.dataframe(out_df.style.format({'Forecast Value': '{:.2f}'}))
 
         # If models_results exist from previous runs, show RMSE comparison
         if st.session_state.models_results:
@@ -351,7 +378,9 @@ with tab2:
             st.subheader("📊 RMSE Comparison (latest run)")
             res = st.session_state.models_results
             rmse_df = pd.DataFrame([
-                {'Model': k, 'RMSE': (v['rmse'] if v else np.nan), 'NRMSE': (v.get('nrmse', np.nan) if isinstance(v, dict) else np.nan),
+                {'Model': k,
+                 'RMSE': (v.get('rmse', np.nan) if isinstance(v, dict) else np.nan),
+                 'NRMSE': (v.get('nrmse', np.nan) if isinstance(v, dict) else np.nan),
                  'MAPE (%)': (v.get('mape', np.nan) if isinstance(v, dict) else np.nan)}
                 for k, v in res.items()
             ])
@@ -373,7 +402,7 @@ with tab3:
         else:
             res = st.session_state.models_results
 
-            # Build forecasts for each model (if fitted present) for next n_future
+            # Build future index
             last_date = df.index[-1]
             if freq == 'A':
                 future_index = pd.date_range(start=last_date + pd.offsets.YearEnd(1), periods=n_future, freq='A')
@@ -383,50 +412,56 @@ with tab3:
                 future_index = pd.date_range(start=last_date + pd.DateOffset(years=1), periods=n_future, freq='Y')
 
             forecasts = {}
+            # For each model, try to produce forecast (best-effort)
             for name, info in res.items():
                 try:
                     if name == 'Linear' and info['fitted'] is not None:
                         coef = info['fitted']
                         x_future = np.arange(len(df), len(df) + n_future)
-                        fut = np.polyval(coef, x_future)
-                        # if original transform used log, we already used test/fit on transformed series earlier; but here we return on original scale
-                        if np.all(df['Value'] > 0) and np.nanmean(np.log(df['Value'])) == np.nanmean(np.log(df['Value'])):
-                            # assume exponential/log used earlier - cannot be certain; safe to use original linear (best-effort)
-                            pass
-                        forecasts[name] = fut
+                        forecasts[name] = np.polyval(coef, x_future)
+
                     elif name == 'Quadratic' and info['fitted'] is not None:
                         coef = info['fitted']
                         x_future = np.arange(len(df), len(df) + n_future)
                         forecasts[name] = np.polyval(coef, x_future)
+
                     elif name == 'Exponential' and info['fitted'] is not None:
                         coef = info['fitted']
                         x_future = np.arange(len(df), len(df) + n_future)
                         forecasts[name] = np.exp(np.polyval(coef, x_future))
+
                     elif name == 'Holt' and info['fitted'] is not None:
                         holt_full = ExponentialSmoothing(df['Value'], trend='add', seasonal=None, initialization_method='estimated').fit()
-                        forecasts[name] = holt_full.forecast(steps=n_future)
+                        forecasts[name] = np.asarray(holt_full.forecast(steps=n_future))
+
                     elif name == 'ARIMA' and info['fitted'] is not None:
                         arima_full = ARIMA(df['Value'], order=(1,1,1)).fit()
-                        forecasts[name] = arima_full.forecast(steps=n_future)
+                        forecasts[name] = np.asarray(arima_full.forecast(steps=n_future))
+
                     elif name == 'SMA' and info['fitted'] is not None:
                         forecasts[name] = np.array([info['fitted']['last']] * n_future)
+
                     else:
                         forecasts[name] = np.array([np.nan]*n_future)
                 except Exception:
                     forecasts[name] = np.array([np.nan]*n_future)
 
-            # Compose comparison dataframe
             comp_df = pd.DataFrame(index=future_index)
             for k, v in forecasts.items():
-                comp_df[k] = v
+                # ensure numeric array of length n_future
+                arr = np.asarray(v, dtype=float)
+                if arr.size != n_future:
+                    arr = np.resize(arr, n_future)
+                # replace nan/inf with last observed
+                arr[~np.isfinite(arr)] = float(df['Value'].iloc[-1])
+                comp_df[k] = arr
 
-            # Make comparison table with RMSE and eq (if available)
+            # Build metrics table
             metrics_rows = []
             for k, v in res.items():
                 rm = v.get('rmse', np.nan) if isinstance(v, dict) else np.nan
                 nr = v.get('nrmse', np.nan) if isinstance(v, dict) else np.nan
                 mp = v.get('mape', np.nan) if isinstance(v, dict) else np.nan
-                eq = ''
                 fitted = v.get('fitted', None) if isinstance(v, dict) else None
                 if isinstance(fitted, (list, np.ndarray, np.generic)):
                     eq = 'Coef: ' + np.array2string(np.asarray(fitted), precision=4, max_line_width=200)
@@ -434,6 +469,8 @@ with tab3:
                     eq = str(type(fitted)).split("'")[1]
                 elif isinstance(fitted, dict):
                     eq = str(fitted)
+                else:
+                    eq = ''
                 metrics_rows.append({'Model': k, 'eq': eq, 'RMSE': rm, 'NRMSE': nr, 'MAPE (%)': mp})
 
             metrics_df = pd.DataFrame(metrics_rows).sort_values('RMSE', na_position='last').reset_index(drop=True)
@@ -442,10 +479,8 @@ with tab3:
             st.dataframe(metrics_df.style.highlight_min(subset=['RMSE'], color='#d4edda'))
 
             st.subheader(f"Forecasts (next {n_future} periods)")
-            # Format numeric and show
             st.dataframe(comp_df.reset_index().rename(columns={'index': 'Date'}).style.format({c: '{:.2f}' for c in comp_df.columns}))
 
-            # Chart
             st.subheader("Forecast Comparison Chart")
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=df.index, y=df['Value'], name='Actual', mode='lines', line=dict(width=3)))
@@ -453,5 +488,9 @@ with tab3:
                 fig.add_trace(go.Scatter(x=comp_df.index, y=comp_df[col], name=col, mode='lines+markers'))
             fig.update_layout(template="plotly_white", xaxis_title="Date", yaxis_title="Value")
             st.plotly_chart(fig, use_container_width=True)
+
+st.markdown("---")
+st.caption("🧠 Developed for Power Demand Forecasting — Auto Model Detection & RMSE Comparison.")
+
 
 
